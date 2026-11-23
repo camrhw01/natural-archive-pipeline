@@ -231,6 +231,67 @@ def auto_trim_edges(a, cap_frac=0.12, inset=4):
     return trims, flags, round(paper, 1)
 
 
+def neatline_angle(g, n=17, band_frac=0.12, strip_frac=0.02):
+    """Skew of the printed border (neatline) relative to the scan, in degrees (positive = clockwise in image
+    coordinates). For each side, narrow strips walk in from the scan edge to the first dark line; a robust line
+    fit through those points gives that side's angle. Returns (angle, per-side angles, spread) or None if no
+    border is found on at least two sides."""
+    H, W = g.shape
+    dark = (g < 110).astype(np.float32)
+    out = {}
+
+    def side_pts(img, axis_len, cross_len):
+        pts = []
+        sw = max(5, int(strip_frac * cross_len))
+        lim = int(band_frac * axis_len)
+        for c in np.linspace(0.15, 0.85, n):
+            x = int(c * cross_len)
+            prof = img[:lim, max(0, x - sw // 2):x + sw // 2 + 1].mean(1)
+            prof = gaussian_filter1d(prof, 1)
+            idx = np.where(prof > 0.5)[0]
+            if len(idx):
+                pts.append((x, float(idx[0])))
+        return pts
+
+    views = {"t": dark, "b": dark[::-1], "l": dark.T, "r": dark.T[::-1]}
+    for k, img in views.items():
+        axis_len, cross_len = img.shape
+        pts = side_pts(img, axis_len, cross_len)
+        if len(pts) < 0.6 * n:
+            continue
+        x = np.array([p[0] for p in pts], float)
+        y = np.array([p[1] for p in pts], float)
+        keep = np.ones(len(x), bool)
+        for _ in range(3):
+            a, b = np.polyfit(x[keep], y[keep], 1)
+            r = y - (a * x + b)
+            mad = float(np.median(np.abs(r[keep]))) + 0.5
+            keep = np.abs(r) <= 3 * mad + 2
+            if keep.sum() < 0.6 * n:
+                break
+        if keep.sum() < 0.6 * n or float(np.median(np.abs(r[keep]))) > 4:
+            continue
+        a, b = np.polyfit(x[keep], y[keep], 1)
+        ang = float(np.degrees(np.arctan(a)))
+        # convert each side's slope to one rotation sense (clockwise positive in image coords)
+        out[k] = {"t": ang, "b": -ang, "l": -ang, "r": ang}[k]
+    if len(out) < 2:
+        return None
+    vals = np.array(list(out.values()))
+    return float(np.median(vals)), {k: round(v, 3) for k, v in out.items()}, float(np.ptp(vals))
+
+
+def deskew(a, angle):
+    """Rotate the whole scan so the printed border is level, then crop the wedges the rotation leaves at the
+    corners so no invented pixels remain. Resampling only (Lanczos); nothing is drawn."""
+    H, W = a.shape[:2]
+    M = cv2.getRotationMatrix2D((W / 2.0, H / 2.0), angle, 1.0)
+    rot = cv2.warpAffine(a, M, (W, H), flags=cv2.INTER_LANCZOS4, borderMode=cv2.BORDER_REPLICATE)
+    t = abs(np.tan(np.radians(angle)))
+    cy, cx = int(np.ceil(W * t / 2)) + 2, int(np.ceil(H * t / 2)) + 2
+    return np.ascontiguousarray(rot[cy:H - cy, cx:W - cx]), [cy, cy, cx, cx]
+
+
 def margin_boxes(shape, borders, inset=4, gap=8, min_len=10):
     H, W = shape[:2]
     t, b, l, r = borders
@@ -611,6 +672,10 @@ class PipelineRequest(BaseModel):
     seed: int = 1
     auto_trim: bool = False
     trim_tblr: Optional[List[int]] = None
+    deskew: Literal["auto", "off"] = "auto"
+    deskew_min_deg: float = 0.03
+    deskew_max_deg: float = 3.0
+    deskew_max_spread_deg: float = 0.35
     max_work_long_px: int = 10000
     work_margin: float = 1.15
 
@@ -646,6 +711,30 @@ def pipeline(req: PipelineRequest) -> Dict[str, Any]:
         if flags:
             res["edge_trim_no_clean_edge"] = flags
         logger.info("Edge trim", trim=et, flags=flags)
+    if req.deskew == "auto":
+        na = neatline_angle(gray(a))
+        if na is None:
+            res["deskew"] = "no border found: scan left as is"
+        else:
+            ang, per, spread = na
+            res["border_angle_deg"] = round(ang, 3)
+            res["border_angle_per_side"] = per
+            res["border_angle_spread_deg"] = round(spread, 3)
+            if spread > req.deskew_max_spread_deg:
+                res["deskew"] = "skipped: border sides disagree (not a straight rectangle; check preview)"
+            elif abs(ang) > req.deskew_max_deg:
+                res["deskew"] = "skipped: angle too large, check preview"
+            elif abs(ang) < req.deskew_min_deg:
+                res["deskew"] = "level already"
+            else:
+                a, crop = deskew(a, ang)
+                H, W = a.shape[:2]
+                after = neatline_angle(gray(a))
+                res["deskew"] = "applied"
+                res["deskew_crop_tblr"] = crop
+                res["deskewed_wh"] = [W, H]
+                res["border_angle_after_deg"] = None if after is None else round(after[0], 3)
+                logger.info("Deskewed to border", angle=round(ang, 3), after=res["border_angle_after_deg"])
     if req.mode == "build" and max(W, H) > req.max_work_long_px and req.sizes and all(s.out_long_px for s in req.sizes):
         target = int(round(max(s.out_long_px for s in req.sizes) * req.work_margin))
         if target < max(W, H):
