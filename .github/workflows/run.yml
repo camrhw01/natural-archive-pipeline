@@ -18,17 +18,16 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - name: Mask upload links
-        env:
-          REQ: ${{ inputs.request }}
+      - name: Read request and mask upload links
         run: |
-          echo "$REQ" > /tmp/request.json
           python3 - <<'PY'
-          import json
-          raw = json.load(open('/tmp/request.json'))
+          import json, os
+          ev = json.load(open(os.environ['GITHUB_EVENT_PATH']))
+          raw = json.loads(ev['inputs']['request'])
           for r in (raw if isinstance(raw, list) else [raw]):
               for u in (r.get('uploads') or {}).values():
                   print('::add-mask::' + u['url'])
+          json.dump(raw, open('/tmp/request.json', 'w'))
           PY
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
