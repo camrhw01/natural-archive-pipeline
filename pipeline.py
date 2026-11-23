@@ -239,6 +239,8 @@ def neatline_angle(g, n=17, band_frac=0.12, strip_frac=0.02):
     H, W = g.shape
     dark = (g < 110).astype(np.float32)
     out = {}
+    diag = {}
+    neatline_angle.diag = diag
 
     def side_pts(img, axis_len, cross_len):
         pts = []
@@ -248,15 +250,22 @@ def neatline_angle(g, n=17, band_frac=0.12, strip_frac=0.02):
             x = int(c * cross_len)
             prof = img[:lim, max(0, x - sw // 2):x + sw // 2 + 1].mean(1)
             prof = gaussian_filter1d(prof, 1)
-            idx = np.where(prof > 0.5)[0]
-            if len(idx):
-                pts.append((x, float(idx[0])))
+            light = np.where(prof < 0.2)[0]
+            if not len(light):
+                continue
+            s0 = int(light[0])  # skip dark scanner background at the very edge
+            seg = prof[s0:]
+            if not len(seg) or seg.max() < 0.3:
+                continue
+            idx = np.where(seg >= max(0.3, 0.6 * seg.max()))[0]
+            pts.append((x, float(s0 + idx[0])))
         return pts
 
     views = {"t": dark, "b": dark[::-1], "l": dark.T, "r": dark.T[::-1]}
     for k, img in views.items():
         axis_len, cross_len = img.shape
         pts = side_pts(img, axis_len, cross_len)
+        diag[k] = {"pts": len(pts)}
         if len(pts) < 0.6 * n:
             continue
         x = np.array([p[0] for p in pts], float)
@@ -269,6 +278,7 @@ def neatline_angle(g, n=17, band_frac=0.12, strip_frac=0.02):
             keep = np.abs(r) <= 3 * mad + 2
             if keep.sum() < 0.6 * n:
                 break
+        diag[k].update(kept=int(keep.sum()), mad=round(float(np.median(np.abs(r[keep]))), 2))
         if keep.sum() < 0.6 * n or float(np.median(np.abs(r[keep]))) > 4:
             continue
         a, b = np.polyfit(x[keep], y[keep], 1)
@@ -715,11 +725,13 @@ def pipeline(req: PipelineRequest) -> Dict[str, Any]:
         na = neatline_angle(gray(a))
         if na is None:
             res["deskew"] = "no border found: scan left as is"
+            res["border_fit"] = dict(neatline_angle.diag)
         else:
             ang, per, spread = na
             res["border_angle_deg"] = round(ang, 3)
             res["border_angle_per_side"] = per
             res["border_angle_spread_deg"] = round(spread, 3)
+            res["border_fit"] = dict(neatline_angle.diag)
             if spread > req.deskew_max_spread_deg:
                 res["deskew"] = "skipped: border sides disagree (not a straight rectangle; check preview)"
             elif abs(ang) > req.deskew_max_deg:
