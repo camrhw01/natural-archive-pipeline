@@ -685,7 +685,7 @@ class PipelineRequest(BaseModel):
     deskew: Literal["auto", "off"] = "auto"
     deskew_min_deg: float = 0.03
     deskew_max_deg: float = 3.0
-    deskew_max_spread_deg: float = 0.35
+    deskew_max_spread_deg: float = 1.0
     max_work_long_px: int = 10000
     work_margin: float = 1.15
 
@@ -733,7 +733,7 @@ def pipeline(req: PipelineRequest) -> Dict[str, Any]:
             res["border_angle_spread_deg"] = round(spread, 3)
             res["border_fit"] = dict(neatline_angle.diag)
             if spread > req.deskew_max_spread_deg:
-                res["deskew"] = "skipped: border sides disagree (not a straight rectangle; check preview)"
+                res["deskew"] = "skipped: border sides disagree by over 1 degree (check preview)"
             elif abs(ang) > req.deskew_max_deg:
                 res["deskew"] = "skipped: angle too large, check preview"
             elif abs(ang) < req.deskew_min_deg:
@@ -742,7 +742,7 @@ def pipeline(req: PipelineRequest) -> Dict[str, Any]:
                 a, crop = deskew(a, ang)
                 H, W = a.shape[:2]
                 after = neatline_angle(gray(a))
-                res["deskew"] = "applied"
+                res["deskew"] = "applied" if spread <= 0.35 else "applied (sides not quite parallel: levelled to their median, check the QA thumbnail)"
                 res["deskew_crop_tblr"] = crop
                 res["deskewed_wh"] = [W, H]
                 res["border_angle_after_deg"] = None if after is None else round(after[0], 3)
