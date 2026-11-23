@@ -1,0 +1,54 @@
+name: map-pipeline
+run-name: map-pipeline ${{ inputs.job_id }}
+on:
+  workflow_dispatch:
+    inputs:
+      job_id:
+        description: Unique id for this run (results/<job_id>.json)
+        required: true
+      request:
+        description: Pipeline request JSON (one object, or a list for a batch)
+        required: true
+permissions:
+  contents: write
+concurrency:
+  group: results-${{ inputs.job_id }}
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Mask upload links
+        env:
+          REQ: ${{ inputs.request }}
+        run: |
+          echo "$REQ" > /tmp/request.json
+          python3 - <<'PY'
+          import json
+          raw = json.load(open('/tmp/request.json'))
+          for r in (raw if isinstance(raw, list) else [raw]):
+              for u in (r.get('uploads') or {}).values():
+                  print('::add-mask::' + u['url'])
+          PY
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Run pipeline
+        run: python pipeline.py /tmp/request.json /tmp/result.json
+      - name: Publish result
+        env:
+          JOB: ${{ inputs.job_id }}
+        run: |
+          git config user.name map-pipeline-bot
+          git config user.email actions@github.com
+          for i in 1 2 3 4 5; do
+            rm -rf /tmp/res && git clone --depth 1 --branch results "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}" /tmp/res 2>/dev/null \
+              || { mkdir -p /tmp/res && cd /tmp/res && git init -q -b results && git remote add origin "https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}"; cd -; }
+            mkdir -p /tmp/res/results && cp /tmp/result.json "/tmp/res/results/$JOB.json"
+            cd /tmp/res && git add -A && git -c user.name=map-pipeline-bot -c user.email=actions@github.com commit -qm "result $JOB" && git push -q origin results && exit 0
+            cd - ; sleep $((i*3))
+          done
+          exit 1
